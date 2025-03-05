@@ -1,80 +1,122 @@
-from flask import Flask, request, jsonify
-import pandas as pd
 import base64
-import torch
-from transformers import AutoTokenizer, AutoModel
+import json
+import zipfile
+from io import BytesIO
+
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+from web3 import Web3
+
 app = Flask(__name__)
 CORS(app)
 
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-model = AutoModel.from_pretrained("bert-base-uncased")
+# Connect to Ethereum (Ganache or Infura)
+WEB3_PROVIDER = "http://127.0.0.1:7545"  # Update if using Infura or Alchemy
+web3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER))
 
-# Data Encoding Function
-def encode_data(data):
-    encoded_data = []
-    for _, row in data.iterrows():
-        # Combine fields into a single string
-        combined = f"{row['License Plate']}|{row['Timestamp']}|{row['Vehicle Type']}"
-        
-        # Use transformer model for encoding
-        inputs = tokenizer(combined, return_tensors="pt", max_length=50, truncation=True, padding="max_length")
-        with torch.no_grad():
-            embeddings = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy()
+# ✅ Fix: Use `.is_connected()` instead of `.isConnected()`
+if not web3.is_connected():
+    print("❌ ERROR: Web3 connection failed. Ensure Ganache is running.")
+    exit()
 
-        # Convert embeddings to Base64 string
-        encoded_string = base64.b64encode(embeddings.tobytes()).decode("utf-8")
-        encoded_data.append(encoded_string)
-    return encoded_data
+# Smart contract details
+CONTRACT_ADDRESS = "0x70eF2ba8450DD30b1Cd08670730a2cB1D7A3053E"
+SENDER_ACCOUNT = web3.eth.accounts[0]  # Ensure this is the correct account
 
-# Data Decoding Function
-def decode_data(encoded_data):
-    decoded_data = []
+# ✅ Replace with actual ABI from build/contracts/DataStorage.json
+CONTRACT_ABI = json.loads("""
+[
+  {
+    "inputs": [],
+    "name": "getZipFile",
+    "outputs": [
+      {
+        "internalType": "string",
+        "name": "",
+        "type": "string"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "string",
+        "name": "_zipData",
+        "type": "string"
+      }
+    ],
+    "name": "storeZipFile",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]
+""")
+
+# Load the contract
+contract = web3.eth.contract(address=CONTRACT_ADDRESS, abi=CONTRACT_ABI)
+
+# Function to zip a file and encode it to Base64
+def zip_file(file):
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        zipf.writestr("vehicle_data.xlsx", file.read())  # Save Excel inside ZIP
+    zip_buffer.seek(0)
+    return base64.b64encode(zip_buffer.getvalue()).decode("utf-8")
+
+# Function to decode Base64 ZIP and extract Excel
+def decode_zip(base64_data):
+    zip_buffer = BytesIO(base64.b64decode(base64_data))
+    with zipfile.ZipFile(zip_buffer, "r") as zipf:
+        extracted_file = zipf.open("vehicle_data.xlsx")
+        return BytesIO(extracted_file.read())
+
+# API to store ZIP file on blockchain
+@app.route("/store", methods=["POST"])
+def store():
     try:
-        for encoded_row in encoded_data:
-            # Decode Base64 string to binary
-            binary_data = base64.b64decode(encoded_row)
-            
-            # Mock decoding logic (update with real logic if available)
-            license_plate, timestamp, vehicle_type = "MockLP", "MockTime", "MockType"
-            decoded_data.append({
-                "License Plate": license_plate,
-                "Timestamp": timestamp,
-                "Vehicle Type": vehicle_type
-            })
-        return pd.DataFrame(decoded_data)
+        if "file" not in request.files:
+            print("❌ ERROR: No file uploaded")
+            return jsonify({"error": "No file uploaded"}), 400
+
+        file = request.files["file"]
+        print(f"✅ Received file: {file.filename}")
+
+        encoded_zip = zip_file(file)
+        print(f"✅ Encoded ZIP size: {len(encoded_zip)} bytes")
+
+        # Check ETH balance
+        balance = web3.eth.get_balance(SENDER_ACCOUNT)
+        if balance < web3.to_wei(0.01, "ether"):
+            return jsonify({"error": "Not enough ETH to store data"}), 400
+
+        # Send transaction to smart contract
+        tx_hash = contract.functions.storeZipFile(encoded_zip).transact({
+            "from": SENDER_ACCOUNT,
+            "gas": 3000000
+        })
+        web3.eth.wait_for_transaction_receipt(tx_hash)
+
+        print("✅ Transaction successful:", tx_hash.hex())
+
+        return jsonify({"message": "File stored on blockchain"}), 200
     except Exception as e:
-        raise ValueError(f"Decoding Error: {e}")
-
-@app.route("/encode", methods=["POST"])
-def encode():
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-
-    file = request.files["file"]
-    try:
-        data = pd.read_csv(file)
-        required_columns = ["License Plate", "Timestamp", "Vehicle Type"]
-        if not all(col in data.columns for col in required_columns):
-            return jsonify({"error": "Invalid file format"}), 400
-
-        encoded_data = encode_data(data)
-        return jsonify({"encodedData": encoded_data}), 200
-    except Exception as e:
+        print("❌ ERROR:", str(e))  # Log the actual error
         return jsonify({"error": str(e)}), 500
 
-@app.route("/decode", methods=["POST"])
-def decode():
+# API to retrieve ZIP from blockchain and extract Excel file
+@app.route("/retrieve", methods=["GET"])
+def retrieve():
     try:
-        encoded_data = request.json.get("encodedData", [])
-        if not encoded_data:
-            return jsonify({"error": "No encoded data provided"}), 400
+        encoded_zip = contract.functions.getZipFile().call()
+        excel_file = decode_zip(encoded_zip)
 
-        decoded_data = decode_data(encoded_data)
-        return jsonify({"decodedData": decoded_data.to_dict(orient="records")}), 200
+        return send_file(excel_file, download_name="retrieved_vehicle_data.xlsx", as_attachment=True)
     except Exception as e:
+        print("❌ ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
